@@ -5,7 +5,7 @@ import json
 import os
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote, parse_qs
 
 import httpx
 from loguru import logger
@@ -68,42 +68,81 @@ class WebSearchTool(Tool):
         """Resolve API key at call time so env/config changes are picked up."""
         return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
 
-    async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if not self.api_key:
-            return (
-                "Error: Brave Search API key not configured. Set it in "
-                "~/.nanobot/config.json under tools.web.search.apiKey "
-                "(or export BRAVE_API_KEY), then restart the gateway."
+    async def _search_brave(self, query: str, n: int) -> str:
+        """Search using Brave Search API."""
+        async with httpx.AsyncClient(proxy=self.proxy) as client:
+            r = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": n},
+                headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
+                timeout=10.0
             )
+            r.raise_for_status()
 
+        results = r.json().get("web", {}).get("results", [])[:n]
+        if not results:
+            return f"No results for: {query}"
+
+        lines = [f"Results for: {query}\n"]
+        for i, item in enumerate(results, 1):
+            title = item.get("title", "")
+            url = item.get("url", "")
+            lines.append(f"{i}. {title}\n   {url}")
+            if desc := item.get("description"):
+                lines.append(f"   {desc}")
+        return "\n".join(lines)
+
+    async def _search_duckduckgo(self, query: str, n: int) -> str:
+        """Search using DuckDuckGo HTML scraping (no API key needed)."""
+        encoded = quote(query)
+        async with httpx.AsyncClient(proxy=self.proxy) as client:
+            r = await client.get(
+                f"https://html.duckduckgo.com/html/?q={encoded}",
+                headers={"User-Agent": USER_AGENT},
+                timeout=10.0
+            )
+            r.raise_for_status()
+
+        body = r.text
+        links = re.findall(
+            r'<a rel="nofollow" class="result__a" href="([^"]+)">(.+?)</a>', body
+        )
+        snippets = re.findall(
+            r'<a class="result__snippet"[^>]*>(.+?)</a>', body
+        )
+
+        if not links:
+            return f"No results for: {query}"
+
+        lines = [f"Results for: {query} (via DuckDuckGo)\n"]
+        for i, (raw_url, raw_title) in enumerate(links[:n], 1):
+            title = _strip_tags(raw_title)
+            parsed = urlparse(raw_url)
+            params = parse_qs(parsed.query)
+            url = params.get("uddg", [raw_url])[0]
+            lines.append(f"{i}. {title}\n   {url}")
+            if i - 1 < len(snippets):
+                lines.append(f"   {_strip_tags(snippets[i - 1])}")
+        return "\n".join(lines)
+
+    async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
+        n = min(max(count or self.max_results, 1), 10)
+        logger.debug("WebSearch: {}", "proxy enabled" if self.proxy else "direct connection")
+
+        # DuckDuckGo primary, Brave as fallback
         try:
-            n = min(max(count or self.max_results, 1), 10)
-            logger.debug("WebSearch: {}", "proxy enabled" if self.proxy else "direct connection")
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0
-                )
-                r.raise_for_status()
-
-            results = r.json().get("web", {}).get("results", [])[:n]
-            if not results:
-                return f"No results for: {query}"
-
-            lines = [f"Results for: {query}\n"]
-            for i, item in enumerate(results, 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
-                    lines.append(f"   {desc}")
-            return "\n".join(lines)
-        except httpx.ProxyError as e:
-            logger.error("WebSearch proxy error: {}", e)
-            return f"Proxy error: {e}"
+            return await self._search_duckduckgo(query, n)
         except Exception as e:
-            logger.error("WebSearch error: {}", e)
-            return f"Error: {e}"
+            logger.warning("DuckDuckGo search failed: {}", e)
+
+        if self.api_key:
+            try:
+                return await self._search_brave(query, n)
+            except Exception as e:
+                logger.error("Brave fallback also failed: {}", e)
+                return f"Error: both DuckDuckGo and Brave failed. Last error: {e}"
+
+        return f"Error: DuckDuckGo search failed and no Brave API key configured."
 
 
 class WebFetchTool(Tool):
