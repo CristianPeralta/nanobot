@@ -51,6 +51,7 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
+        fallback_models: list[str] | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
         max_tokens: int = 4096,
@@ -71,6 +72,7 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.fallback_models = fallback_models or []
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -198,14 +200,32 @@ class AgentLoop:
 
             tool_defs = self.tools.get_definitions()
 
-            response = await self.provider.chat_with_retry(
-                messages=messages,
-                tools=tool_defs,
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                reasoning_effort=self.reasoning_effort,
-            )
+            # Try primary model, then fallbacks on any error
+            models_to_try = [self.model] + self.fallback_models
+            response = None
+            for _model_idx, _try_model in enumerate(models_to_try):
+                try:
+                    response = await self.provider.chat_with_retry(
+                        messages=messages,
+                        tools=tool_defs,
+                        model=_try_model,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        reasoning_effort=self.reasoning_effort,
+                    )
+                    # If response is an error, try next model
+                    if response.finish_reason == "error" and _model_idx < len(models_to_try) - 1:
+                        logger.warning("Model {} returned error ({}), trying fallback {}",
+                                       _try_model, (response.content or "")[:100], models_to_try[_model_idx + 1])
+                        continue
+                    break
+                except Exception as _e:
+                    if _model_idx < len(models_to_try) - 1:
+                        logger.warning("Model {} failed ({}), trying fallback {}",
+                                       _try_model, str(_e)[:100], models_to_try[_model_idx + 1])
+                        continue
+                    raise
+            assert response is not None
 
             if response.has_tool_calls:
                 if on_progress:

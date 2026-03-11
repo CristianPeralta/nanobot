@@ -249,8 +249,12 @@ class LiteLLMProvider(LLMProvider):
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
         self._apply_model_overrides(model, kwargs)
 
-        # Pass api_key directly — more reliable than env vars alone
-        if self.api_key:
+        # Pass api_key only if model belongs to same provider as default.
+        # For cross-provider fallback models (groq/, cerebras/, openrouter/),
+        # let litellm resolve the correct key from env vars.
+        _default_prefix = (self.default_model or "").split("/")[0].lower()
+        _model_prefix = (model or "").split("/")[0].lower()
+        if self.api_key and _model_prefix == _default_prefix:
             kwargs["api_key"] = self.api_key
 
         # Pass api_base for custom endpoints
