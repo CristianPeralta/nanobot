@@ -393,18 +393,9 @@ class AgentLoop:
         if cmd == "/new":
             try:
                 if not await self.memory_consolidator.archive_unconsolidated(session):
-                    return OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content="Memory archival failed, session not cleared. Please try again.",
-                    )
+                    logger.warning("/new: memory consolidation failed, clearing session anyway")
             except Exception:
-                logger.exception("/new archival failed for {}", session.key)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
-                )
+                logger.exception("/new archival failed for {}, clearing session anyway", session.key)
 
             session.clear()
             self.sessions.save(session)
